@@ -1,0 +1,216 @@
+import pypdf
+import pandas as pd
+import re
+from reportlab.lib.pagesizes import letter, landscape
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+
+# 1. CONFIGURAÇÃO DOS SEUS ARQUIVOS REAIS
+arquivo_matriculas_pdf = "GRUPO OLIMPO - Matriculados 2026.pdf"
+arquivo_aprovados_pdf = "Vestibular 2026 - 2 Uberlandia Lista de Classificados.pdf" 
+arquivo_final_excel = "resultado_cruzamento_final.xlsx"
+arquivo_final_pdf = "resultado_cruzamento_final.pdf"
+
+# --- ETAPA 1: EXTRAÇÃO DO PDF DE MATRÍCULAS BRUTO ---
+print("Iniciando a extração do seu PDF de Matrículas original...")
+dados_matriculas = []
+
+with open(arquivo_matriculas_pdf, "rb") as arquivo:
+    leitor = pypdf.PdfReader(arquivo)
+    for num_pagina, pagina in enumerate(leitor.pages):
+        texto_pagina = pagina.extract_text()
+        if texto_pagina:
+            for linha in texto_pagina.split("\n"):
+                linha_limpa = linha.strip()
+                if " - " in linha_limpa and any(char.isdigit() for char in linha_limpa):
+                    dados_matriculas.append({
+                        "Pagina": num_pagina + 1,
+                        "Texto_Completo": linha_limpa
+                    })
+
+df_matriculados = pd.DataFrame(dados_matriculas)
+print(f"[✓] Matrículas processadas: {len(df_matriculados)} linhas válidas.")
+
+# --- ETAPA 2: EXTRAÇÃO DO PDF DE APROVADOS (COM BLINDAGEM DE CAMPUS E PREFIXO UFU) ---
+print("\nIniciando a extração do PDF de Aprovados do Vestibular UFU...")
+aprovados_lista = []
+nome_curso_acumulado = "NÃO IDENTIFICADO"
+curso_atual = "UFU - NÃO IDENTIFICADO"
+
+# A nossa "trava" para impedir que ele leia lixo do rodapé
+lendo_cabecalho_curso = False 
+
+with open(arquivo_aprovados_pdf, "rb") as arquivo:
+    leitor = pypdf.PdfReader(arquivo)
+    for pagina in leitor.pages:
+        texto = pagina.extract_text()
+        if texto:
+            for linha in texto.split("\n"):
+                linha_limpa = linha.strip()
+                
+                if "Lista de Classificados" in linha_limpa or "Concurso Seletivo" in linha_limpa or "UNIVERSIDADE" in linha_limpa or "Inscrição Nome EB Concorre" in linha_limpa:
+                    continue
+                
+                # SE FOR A LINHA DE UM ALUNO
+                if re.match(r'^\d{8,}', linha_limpa):
+                    lendo_cabecalho_curso = False # FECHA A TRAVA! Já estamos nos alunos.
+                    
+                    partes = linha_limpa.split()
+                    inscricao = partes[0]
+                    concorrencia = partes[-1] if partes[-1] in ["AC", "LI_EP", "LI_PPI", "LB_EP", "LB_PPI", "LB_PCD", "LI_PCD", "LB_Q"] else "AC"
+                    nota_eb = partes[-2] if partes[-2].replace('.', '', 1).isdigit() else "N/A"
+                    palavras_nome = [p for p in partes[1:] if p.isupper() and p not in ["AC", "LI_EP", "LI_PPI", "LB_EP", "LB_PPI", "LB_PCD", "LI_PCD", "LB_Q"] and not p.isdigit()]
+                    nome_completo = " ".join(palavras_nome).strip()
+                    if nome_completo:
+                        aprovados_lista.append({
+                            "Inscricao_Vestibular": inscricao,
+                            "Nome_Aprovado": nome_completo,
+                            "Curso": curso_atual,
+                            "Nota_EB": nota_eb,
+                            "Modalidade_Concorrencia": concorrencia,
+                            "Linha_Original_Vestibular": linha_limpa
+                        })
+                    continue # Pula para a próxima linha
+
+                # RECONSTRUTOR COM TRATAMENTO DE CAMPUS E MÚLTIPLAS LINHAS
+                if " - " in linha_limpa and not re.match(r'^\d', linha_limpa) and len(linha_limpa) > 12:
+                    linha_upper = linha_limpa.upper()
+                    curso_limpo = re.sub(r'\s*-\s*(?:AC|LI_EP|LI_PPI|LB_EP|LB_PPI|LB_PCD|LI_PCD|LB_Q)\s*$', '', linha_limpa, flags=re.IGNORECASE).strip().upper()
+                    
+                    prefixos_campus = ["SANTA MÔNICA", "SANTA MONICA", "UMUARAMA", "GLÓRIA", "GLORIA", "MONTE CARMELO", "PATOS DE MINAS", "ITUIUTABA", "PONTAL", "TUPACIGUARA", "EAD"]
+                    
+                    inicia_com_campus = any(linha_upper.startswith(cp) for cp in prefixos_campus)
+                    
+                    # A MÁGICA DA LÓGICA AQUI:
+                    # Se a trava está fechada (acabamos de ler alunos) OU achou um campus explícito, inicia um CURSO NOVO.
+                    if not lendo_cabecalho_curso or inicia_com_campus:
+                        lendo_cabecalho_curso = True # ABRE A TRAVA!
+                        curso_isolado = curso_limpo
+                        
+                        # Limpa o nome do campus da frente, se existir
+                        for cp in prefixos_campus:
+                            if curso_limpo.startswith(cp):
+                                curso_isolado = re.sub(rf'^{cp}\s*-\s*', '', curso_limpo).strip()
+                                break
+                        
+                        nome_curso_acumulado = curso_isolado 
+                    else:
+                        # Só junta as linhas adicionais ("Bacharelado", etc) se a trava já estava aberta
+                        if nome_curso_acumulado != "NÃO IDENTIFICADO":
+                            nome_curso_acumulado += f" - {curso_limpo}"
+                    
+                    curso_atual = f"UFU - {nome_curso_acumulado}"
+                    continue
+
+df_aprovados = pd.DataFrame(aprovados_lista)
+print(f"[✓] Vestibular processado: {len(df_aprovados)} candidatos.")
+# --- ETAPA 3: CRUZAMENTO DE DADOS CIRÚRGICO ---
+print("\nCruzando as duas listas e identificando dados escolares...")
+df_aprovados['Nome_Busca'] = df_aprovados['Nome_Aprovado'].str.upper().str.strip()
+df_matriculados['Texto_Busca'] = df_matriculados['Texto_Completo'].str.upper().str.strip()
+
+alunos_encontrados = []
+
+for _, linha_aprovado in df_aprovados.iterrows():
+    nome = linha_aprovado['Nome_Busca']
+    correspondencias = df_matriculados[df_matriculados['Texto_Busca'].str.contains(nome, regex=False, na=False)]
+    
+    if not correspondencias.empty:
+        for _, merge_linha in correspondencias.iterrows():
+            texto_matr_original = str(merge_linha['Texto_Completo'])
+            texto_matr_upper = texto_matr_original.upper()
+            
+            partes_hifen = texto_matr_original.split(" - ")
+            serie_aluno = partes_hifen[-1].strip().upper() if len(partes_hifen) > 1 else "NÃO ESPECIFICADA"
+
+            match_matr = re.search(r'\b\d{5,7}\b', texto_matr_original)
+            matricula_escola = match_matr.group(0) if match_matr else "NÃO ENCONTRADA"
+
+            match_unidade = re.search(r'\bOLIMPO\s+([A-Z0-9ªºáéíóúâêîôûãõç\-_]+)', texto_matr_upper)
+            if match_unidade:
+                termo_unidade = match_unidade.group(1).strip()
+                unidade = "ÁGUAS CLARAS" if termo_unidade == "AC" else f"OLIMPO {termo_unidade}"
+            else:
+                if "AGUAS CLARAS" in texto_matr_upper: unidade = "ÁGUAS CLARAS"
+                elif "UBERLANDIA" in texto_matr_upper or "UDI" in texto_matr_upper: unidade = "UBERLÂNDIA"
+                elif "GOIANIA" in texto_matr_upper or "GYN" in texto_matr_upper: unidade = "GOIÂNIA"
+                else: unidade = "NÃO IDENTIFICADA"
+
+            alunos_encontrados.append({
+                "Matrícula Escola": matricula_escola,
+                "Nome do Aluno": linha_aprovado['Nome_Aprovado'],
+                "Unidade Olimpo": unidade,
+                "Série do Aluno": serie_aluno,
+                "Curso Aprovado (UFU)": linha_aprovado['Curso'],
+                "Nota (EB)": linha_aprovado['Nota_EB'],
+                "Tipo de Vaga/Cota": linha_aprovado['Modalidade_Concorrencia'],
+                "Insc_Chave": linha_aprovado['Inscricao_Vestibular']
+            })
+
+df_resultado = pd.DataFrame(alunos_encontrados)
+if not df_resultado.empty:
+    df_resultado = df_resultado.drop_duplicates(subset=["Insc_Chave", "Nome do Aluno"])
+    df_resultado = df_resultado.sort_values(by=["Unidade Olimpo", "Nome do Aluno"])
+    df_resultado = df_resultado.drop(columns=["Insc_Chave"])
+
+# --- ETAPA 4: SALVAR EXCEL CONSOLIDADO ---
+df_resultado.to_excel(arquivo_final_excel, index=False)
+print(f"[✓] Planilha Excel salva em: '{arquivo_final_excel}'")
+
+# --- ETAPA 5: GERAÇÃO DO PDF FORMATADO ---
+print("Iniciando a generation do relatório em formato PDF...")
+doc = SimpleDocTemplate(arquivo_final_pdf, pagesize=landscape(letter), rightMargin=25, leftMargin=25, topMargin=30, bottomMargin=30)
+elementos = []
+
+estilos = getSampleStyleSheet()
+estilo_titulo = ParagraphStyle('Titulo', parent=estilos['Heading1'], fontSize=16, leading=20, textColor=colors.HexColor("#1A365D"), alignment=1)
+estilo_celula = ParagraphStyle('Celula', parent=estilos['Normal'], fontSize=8, leading=10)
+estilo_cabecalho_celula = ParagraphStyle('CabecalhoCel', parent=estilos['Normal'], fontSize=9, leading=11, textColor=colors.white, fontName="Helvetica-Bold")
+
+elementos.append(Paragraph("GRUPO OLIMPO - RELATÓRIO CONSOLIDADO DE APROVADOS (VESTIBULAR UFU)", estilo_titulo))
+elementos.append(Spacer(1, 15))
+
+dados_tabela = [[
+    Paragraph("Matrícula Escola", estilo_cabecalho_celula),
+    Paragraph("Nome do Aluno", estilo_cabecalho_celula),
+    Paragraph("Unidade Olimpo", estilo_cabecalho_celula),
+    Paragraph("Série do Aluno", estilo_cabecalho_celula),
+    Paragraph("Curso Aprovado", estilo_cabecalho_celula),
+    Paragraph("Nota (EB)", estilo_cabecalho_celula),
+    Paragraph("Cota/Vaga", estilo_cabecalho_celula)
+]]
+
+for _, linha in df_resultado.iterrows():
+    dados_tabela.append([
+        Paragraph(str(linha["Matrícula Escola"]), estilo_celula),
+        Paragraph(str(linha["Nome do Aluno"]), estilo_celula),
+        Paragraph(str(linha["Unidade Olimpo"]), estilo_celula),
+        Paragraph(str(linha["Série do Aluno"]), estilo_celula),
+        Paragraph(str(linha["Curso Aprovado (UFU)"]), estilo_celula),
+        Paragraph(str(linha["Nota (EB)"]), estilo_celula),
+        Paragraph(str(linha["Tipo de Vaga/Cota"]), estilo_celula)
+    ])
+
+tabela_pdf = Table(dados_tabela, colWidths=[90, 160, 110, 90, 190, 60, 60])
+
+estilo_tabela = TableStyle([
+    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1A365D")),
+    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+    ('TOPPADDING', (0, 0), (-1, -1), 5),
+    ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+])
+
+for i in range(1, len(dados_tabela)):
+    if i % 2 == 0:
+        estilo_tabela.add('BACKGROUND', (0, i), (-1, i), colors.HexColor("#F8FAFC"))
+
+tabela_pdf.setStyle(estilo_tabela)
+elementos.append(tabela_pdf)
+
+doc.build(elementos)
+print(f"[✓] Relatório oficial em formato PDF gerado: '{arquivo_final_pdf}'")
+print(f"\n=== PROCESSAMENTO CONCLUÍDO COM SUCESSO ===")
+print(f"Total de aprovados únicos mapeados de forma definitiva: {len(df_resultado)}")
